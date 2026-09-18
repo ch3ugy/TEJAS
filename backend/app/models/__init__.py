@@ -1,0 +1,16 @@
+from app.models.models import (
+    User,
+    Camera,
+    Zone,
+    WatchlistEntry,
+    ThreatRule,
+    Event,
+    Incident,
+    Alert,
+    Plate,
+    AuditLog,
+    Evidence,
+    GlobalTrack,
+    TrackHandoff,
+    EnrolledFace,
+)

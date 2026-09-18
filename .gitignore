@@ -1,0 +1,61 @@
+# Environments & Virtual Envs
+.venv/
+env/
+venv/
+ENV/
+*.venv
+
+# Environment variables & Secrets
+.env
+.env.*
+backend/.env
+!.env.example
+
+# Node / Frontend
+node_modules/
+frontend/node_modules/
+frontend/dist/
+.vite/
+.npm/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# Databases & Local Data
+*.db
+*.sqlite
+*.sqlite3
+backend/tejas.db
+data/evidence/*
+!data/evidence/.gitkeep
+data/faces/*
+!data/faces/.gitkeep
+
+# Video recordings (keep repo light)
+*.mp4
+*.avi
+*.mkv
+*.mov
+*.h264
+
+# Logs
+*.log
+logs/
+
+# IDEs & OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Scratch directory
+scratch/
+
+# Large Model weights (keep repo light)
+*.pt
+*.onnx
+!ai/face/models/*.onnx

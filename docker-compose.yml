@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15-alpine
+    container_name: tejas_db
+    restart: always
+    environment:
+      POSTGRES_USER: tejas_admin
+      POSTGRES_PASSWORD: tejas_secure_password_2026
+      POSTGRES_DB: tejas_surveillance
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: tejas_backend
+    restart: always
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://tejas_admin:tejas_secure_password_2026@db:5432/tejas_surveillance
+      - SECRET_KEY=tejas_border_intelligence_secret_key_2026_sih
+    depends_on:
+      - db
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: tejas_frontend
+    restart: always
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
