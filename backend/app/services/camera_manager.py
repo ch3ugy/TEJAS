@@ -120,6 +120,16 @@ class CameraPipeline:
         self.face_cache: Dict[int, Dict[str, Any]] = {}
         self.face_evaluating: set = set()
 
+        # Re-ID result cache — keyed by ByteTrack local_track_id, NOT by the transient
+        # per-frame track dict. _run_inference() rebuilds a brand-new list of dicts on
+        # every cycle, so a Re-ID result written only onto the dict that was queued for
+        # the async worker would vanish the moment the next inference cycle replaces
+        # self.active_tracks (which happens far more often than Re-ID can complete).
+        # Caching by track_id lets every subsequent frame re-attach the already-known
+        # persistent identity immediately, instead of only the one frame it was computed on.
+        self.reid_cache: Dict[int, Dict[str, Any]] = {}
+        self.reid_cache_lock = threading.Lock()
+
         # Thread handles
         self._capture_thread: Optional[threading.Thread] = None
         self._inference_thread: Optional[threading.Thread] = None
@@ -346,6 +356,11 @@ class CameraPipeline:
                             if reid_result.get("global_id"):
                                 ent["global_person_id"] = reid_result["global_id"]
                                 ent["reid_status"] = reid_result.get("status")
+                                with self.reid_cache_lock:
+                                    self.reid_cache[t_id] = {
+                                        "global_person_id": reid_result["global_id"],
+                                        "reid_status": reid_result.get("status"),
+                                    }
                         except Exception as reid_err:
                             logger.debug(f"[{self.camera_id}] Re-ID skipped for track {t_id}: {reid_err}")
 
@@ -393,16 +408,33 @@ class CameraPipeline:
                         persons += 1
                     else:
                         vehicles += 1
-                    active.append({
+                    det = {
                         "track_id": tid,
                         "class_name": cls_name,
                         "confidence": round(conf, 3),
                         "box": [x1, y1, x2, y2],
                         "camera_id": self.camera_id,
-                    })
+                    }
+                    if cls_name == "person" and tid >= 0:
+                        with self.reid_cache_lock:
+                            cached = self.reid_cache.get(tid)
+                        if cached:
+                            det["global_person_id"] = cached["global_person_id"]
+                            det["reid_status"] = cached["reid_status"]
+                    active.append(det)
         except Exception as e:
             logger.error(f"[{self.camera_id}] Inference error: {e}")
             return [], 0.0
+
+        # Prune Re-ID cache entries for local track ids ByteTrack is no longer reporting
+        # (person left frame / occluded past recovery). Persistent identity itself lives
+        # in reid_service's DB-backed gallery, not here — this only forgets the transient
+        # local_track_id -> global_id shortcut so a reused/next id doesn't inherit a stale one.
+        current_ids = {t["track_id"] for t in active if t.get("class_name") == "person" and t.get("track_id", -1) >= 0}
+        with self.reid_cache_lock:
+            stale = [k for k in self.reid_cache if k not in current_ids]
+            for k in stale:
+                del self.reid_cache[k]
 
         self.active_tracks = active
         self.detection_counts = {"person": persons, "vehicle": vehicles, "total": persons + vehicles}
@@ -493,9 +525,13 @@ class CameraPipeline:
             cls = trk["class_name"]
             tid = trk.get("track_id", -1)
             conf = trk.get("confidence", 0.0)
+            gpid = trk.get("global_person_id")
             color = (0, 255, 128) if cls == "person" else (255, 180, 0)
+            if gpid:
+                color = (0, 210, 255) if trk.get("reid_status") == "REIDENTIFIED" else (0, 255, 128)
             cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-            label = f"{cls.upper()} #{tid} ({int(conf*100)}%)" if tid >= 0 else f"{cls.upper()} ({int(conf*100)}%)"
+            base_label = f"{cls.upper()} #{tid} ({int(conf*100)}%)" if tid >= 0 else f"{cls.upper()} ({int(conf*100)}%)"
+            label = f"{base_label} [{gpid}]" if gpid else base_label
             (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
             cv2.rectangle(canvas, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, max(0, y1)), color, -1)
             cv2.putText(canvas, label, (x1 + 2, max(th + 2, y1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
