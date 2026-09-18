@@ -1,507 +1,393 @@
 """
-TEJAS Camera Manager — Phase 2 (Step 19)
-Multi-camera pipeline architecture.
+TEJAS Event Engine — Phase 2
+Real zone state machine + operational alert logic.
+No numerical threat scores. No LOW/MEDIUM/HIGH/CRITICAL.
 
-Each camera has its own:
-  - VideoSource (RTSP / webcam / MP4)
-  - YOLO detector
-  - ByteTrack tracker
-  - Per-camera EventEngine state
-
-Cameras fail independently.
-CameraManager is the single entry point for pipeline control.
+Pipeline:
+  Detection → Tracking → Entity State → Zone → Event → Context → Operational Alert
 """
 from __future__ import annotations
 
+import datetime
 import logging
-import queue
-import threading
 import time
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+import uuid
+from typing import Dict, List, Any, Optional, Set, Tuple
 
 import cv2
 import numpy as np
 
-try:
-    import torch
-    _CUDA_AVAILABLE = torch.cuda.is_available()
-except ImportError:
-    _CUDA_AVAILABLE = False
-
-from ultralytics import YOLO
-
 from app.config import settings
-from app.services.video_source import VideoSource
-from app.services.reid_service import reid_service
+from app.database import SessionLocal
+from app.models.models import Event, Alert, Incident, Zone, Evidence, AuditLog
+from app.services.operational_alert_engine import (
+    OperationalContext,
+    AuthorizationState,
+    EventType,
+    ZoneType,
+    SENSITIVE_ZONE_TYPES,
+    AlertLevel,
+    evaluate_alert_level,
+    should_create_alert,
+    should_create_incident,
+)
+from app.services.evidence_service import evidence_service
+from app.websocket.connection_manager import manager
 
-logger = logging.getLogger("tejas.camera_manager")
-
-# ── Target COCO class IDs ──────────────────────
-TARGET_CLASS_IDS = [0, 2, 3, 5, 7]  # person, car, motorcycle, bus, truck
-YOLO_MODEL_PATH: Optional[str] = None
-
-
-def _resolve_model_path() -> str:
-    global YOLO_MODEL_PATH
-    if YOLO_MODEL_PATH:
-        return YOLO_MODEL_PATH
-    candidates = [
-        Path("yolov8n.pt"),
-        Path(__file__).resolve().parent.parent.parent / "yolov8n.pt",
-        Path(__file__).resolve().parent.parent.parent.parent / "yolov8n.pt",
-    ]
-    for p in candidates:
-        if p.exists():
-            YOLO_MODEL_PATH = str(p)
-            return YOLO_MODEL_PATH
-    return "yolov8n.pt"
+logger = logging.getLogger("tejas.event_engine")
 
 
 # ──────────────────────────────────────────────
-# CameraPipeline — one per physical/logical camera
+# Entity Track State (Phase 2)
 # ──────────────────────────────────────────────
-class CameraPipeline:
+class TrackState:
     """
-    Independent pipeline for a single camera source.
-    Runs 3 threads: Capture / Inference+Annotate / AsyncProtection
+    Per-entity state for a single camera's tracking session.
+    Replaces threat_score/severity with OperationalContext.
+    """
+
+    def __init__(self, track_id: int, class_name: str, camera_id: str, first_seen: float):
+        self.track_id = track_id
+        self.class_name = class_name
+        self.camera_id = camera_id
+        self.first_seen = first_seen
+        self.last_seen = first_seen
+
+        # Operational context — no threat score
+        self.context = OperationalContext(
+            entity_id=f"{class_name.upper()} #{track_id}",
+            camera_id=camera_id,
+            entity_type=class_name,
+        )
+
+        # Zone state machine (Step 7)
+        self.current_zones: Set[str] = set()          # Zone IDs entity is currently inside
+        self.zone_entry_times: Dict[str, float] = {}   # zone_id → entry timestamp
+        self.loiter_fired_zones: Set[str] = set()      # zones where loitering event fired
+        self.zone_type_map: Dict[str, str] = {}        # zone_id → zone type
+
+        # Event history (for de-duplication and incident building)
+        self.initial_event_fired = False
+        self.incident_id: Optional[str] = None
+        self.timeline: List[Dict[str, Any]] = []
+
+
+# ──────────────────────────────────────────────
+# Patrol Session Model (Step 10)
+# ──────────────────────────────────────────────
+class PatrolSession:
+    """
+    An active patrol session that authorizes entities in expected zones/cameras.
     """
 
     def __init__(
         self,
-        camera_id: str,
-        source: Union[int, str],
-        model_path: str,
-        device: str,
-        inference_fps: int,
-        inference_width: int,
-        inference_height: int,
-        confidence_threshold: float = 0.35,
+        session_id: str,
+        unit: str,
+        authorized_face_ids: List[str],
+        authorized_plate_ids: List[str],
+        expected_cameras: List[str],
+        expected_zone_types: List[str],
+        start_time: float,
+        expiry_time: float,
     ):
-        self.camera_id = camera_id
-        self.source = source
-        self.model_path = model_path
-        self.device = device
-        self.inference_fps = max(5, min(30, inference_fps))
-        self.inference_width = inference_width
-        self.inference_height = inference_height
-        self.confidence_threshold = confidence_threshold
+        self.session_id = session_id
+        self.unit = unit
+        self.authorized_face_ids: Set[str] = set(authorized_face_ids)
+        self.authorized_plate_ids: Set[str] = set(authorized_plate_ids)
+        self.expected_cameras: Set[str] = set(expected_cameras)
+        self.expected_zone_types: Set[str] = set(expected_zone_types)
+        self.start_time = start_time
+        self.expiry_time = expiry_time
 
-        # State
-        self.is_running = False
-        self.is_connected = False
-        self.cap: Optional[cv2.VideoCapture] = None
-        self.model: Optional[YOLO] = None
+    def is_active(self) -> bool:
+        return time.time() <= self.expiry_time
 
-        # Thread synchronization
-        self.lock = threading.Lock()
-        self.frame_lock = threading.Lock()
-        self.new_frame_event = threading.Event()
-        self.new_jpeg_event = threading.Event()
-        self.event_queue: queue.Queue = queue.Queue(maxsize=10)
+    def authorizes_camera(self, camera_id: str) -> bool:
+        return camera_id in self.expected_cameras or not self.expected_cameras
 
-        # Buffers
-        self.latest_raw_frame: Optional[np.ndarray] = None
-        self.latest_jpeg: Optional[bytes] = None
-        self.latest_processed_frame: Optional[np.ndarray] = None
+    def authorizes_zone_type(self, zone_type: str) -> bool:
+        return zone_type in self.expected_zone_types or not self.expected_zone_types
 
-        # Telemetry
-        self.capture_fps: float = 0.0
-        self.infer_fps: float = 0.0
-        self.inference_ms: float = 0.0
-        self.active_tracks: List[Dict[str, Any]] = []
-        self.detection_counts: Dict[str, int] = {"person": 0, "vehicle": 0, "total": 0}
-        self.frame_count: int = 0
 
-        # Zone data (camera-specific)
-        self.zones: List[Dict[str, Any]] = []
+# ──────────────────────────────────────────────
+# Event Engine (Phase 2)
+# ──────────────────────────────────────────────
+class EventEngine:
+    def __init__(self):
+        self.tracks: Dict[Tuple[str, int], TrackState] = {}  # (camera_id, track_id) → state
+        self.patrol_sessions: Dict[str, PatrolSession] = {}  # session_id → session
 
-        # Face scan cache
-        self.face_cache: Dict[int, Dict[str, Any]] = {}
-        self.face_evaluating: set = set()
+        # Configuration from settings
+        self.loiter_threshold: float = settings.LOITER_THRESHOLD_SECONDS
+        self.night_start_hour: int = settings.NIGHT_START_HOUR
+        self.night_end_hour: int = settings.NIGHT_END_HOUR
+        self.force_night_mode: bool = False
 
-        # Re-ID result cache — keyed by ByteTrack local_track_id, NOT by the transient
-        # per-frame track dict. _run_inference() rebuilds a brand-new list of dicts on
-        # every cycle, so a Re-ID result written only onto the dict that was queued for
-        # the async worker would vanish the moment the next inference cycle replaces
-        # self.active_tracks (which happens far more often than Re-ID can complete).
-        # Caching by track_id lets every subsequent frame re-attach the already-known
-        # persistent identity immediately, instead of only the one frame it was computed on.
-        self.reid_cache: Dict[int, Dict[str, Any]] = {}
-        self.reid_cache_lock = threading.Lock()
-
-        # Thread handles
-        self._capture_thread: Optional[threading.Thread] = None
-        self._inference_thread: Optional[threading.Thread] = None
-        self._async_thread: Optional[threading.Thread] = None
-
-    def load_model(self) -> bool:
-        try:
-            self.model = YOLO(self.model_path)
-            self.model.to(self.device)
-            logger.info(f"[{self.camera_id}] YOLO loaded on {self.device}")
+    # ── Night context ──────────────────────────
+    def is_night_time(self) -> bool:
+        if self.force_night_mode:
             return True
-        except Exception as e:
-            logger.error(f"[{self.camera_id}] Model load failed: {e}")
-            self.model = None
+        h = datetime.datetime.now().hour
+        if self.night_start_hour > self.night_end_hour:
+            return h >= self.night_start_hour or h < self.night_end_hour
+        return self.night_start_hour <= h < self.night_end_hour
+
+    # ── Reference point (bottom-center of bbox) ─
+    @staticmethod
+    def get_reference_point(box: List[int]) -> Tuple[int, int]:
+        x1, y1, x2, y2 = box
+        return int((x1 + x2) / 2), int(y2)
+
+    # ── Point-in-polygon (OpenCV) ──────────────
+    @staticmethod
+    def is_point_in_polygon(ref_point: Tuple[int, int], contour: np.ndarray) -> bool:
+        if contour is None or len(contour) < 3:
             return False
+        return cv2.pointPolygonTest(
+            contour, (float(ref_point[0]), float(ref_point[1])), measureDist=False
+        ) >= 0
 
-    def reload_zones(self):
-        """Loads zones from DB that belong to this camera (matching id or code)."""
-        try:
-            from app.database import SessionLocal
-            from app.models.models import Zone, Camera
-            db = SessionLocal()
-            cam_row = db.query(Camera).filter(
-                (Camera.id == self.camera_id) | (Camera.code == self.camera_id)
-            ).first()
-            target_codes = {self.camera_id}
-            if cam_row:
-                if cam_row.id:
-                    target_codes.add(cam_row.id)
-                if cam_row.code:
-                    target_codes.add(cam_row.code)
+    # ── Patrol session management ──────────────
+    def register_patrol_session(self, session: PatrolSession):
+        self.patrol_sessions[session.session_id] = session
+        logger.info(f"Patrol session registered: {session.session_id} unit={session.unit}")
 
-            db_zones = db.query(Zone).filter(Zone.camera_code.in_(target_codes)).all()
-            zones_data = [
-                {
-                    "id": z.id,
-                    "name": z.name,
-                    "type": z.type,
-                    "color": z.color or "#EF4444",
-                    "points_json": z.points_json or [],
-                    "fence_type": z.fence_type or "2D",
-                    "fence_depth": float(z.fence_depth or 0.0),
-                    "camera_code": z.camera_code,
-                }
-                for z in db_zones
-            ]
-            with self.lock:
-                self.zones = zones_data
-            db.close()
-            logger.info(f"[{self.camera_id}] Loaded {len(zones_data)} zones from DB (codes: {target_codes})")
-        except Exception as e:
-            logger.warning(f"[{self.camera_id}] Zone reload failed: {e}")
+    def _get_active_patrol_for_camera(self, camera_id: str) -> Optional[PatrolSession]:
+        """Returns the first active patrol session that covers the given camera."""
+        for session in self.patrol_sessions.values():
+            if session.is_active() and session.authorizes_camera(camera_id):
+                return session
+        return None
 
-    def start(self):
-        if self.is_running:
-            return
-        self.is_running = True
-        self._capture_thread = threading.Thread(
-            target=self._capture_worker, daemon=True, name=f"Cap-{self.camera_id}"
-        )
-        self._inference_thread = threading.Thread(
-            target=self._inference_worker, daemon=True, name=f"Inf-{self.camera_id}"
-        )
-        self._async_thread = threading.Thread(
-            target=self._async_worker, daemon=True, name=f"Async-{self.camera_id}"
-        )
-        self._capture_thread.start()
-        self._inference_thread.start()
-        self._async_thread.start()
-        logger.info(f"[{self.camera_id}] Pipeline started — source={self.source}")
+    def _is_entity_authorized_by_patrol(
+        self, track: TrackState, zone_type: str
+    ) -> Optional[str]:
+        """
+        Returns patrol_session_id if this entity is authorized by an active patrol
+        that covers its camera and zone type. Otherwise returns None.
+        """
+        session = self._get_active_patrol_for_camera(track.camera_id)
+        if session is None:
+            return None
 
-    def stop(self):
-        self.is_running = False
-        self.new_frame_event.set()
-        with self.frame_lock:
-            if self.cap:
-                try:
-                    self.cap.release()
-                except Exception:
-                    pass
-                self.cap = None
-        self.is_connected = False
-        logger.info(f"[{self.camera_id}] Pipeline stopped")
+        # Check if face or plate is explicitly authorized
+        face_id = track.context.face_identity
+        plate_id = track.context.plate_identity
+        face_authorized = face_id and face_id in session.authorized_face_ids
+        plate_authorized = plate_id and plate_id in session.authorized_plate_ids
 
-    # ── Thread 1: Capture ──────────────────────
-    def _capture_worker(self):
-        last_t = time.time()
-        reconnect_at = 0.0
+        if face_authorized or plate_authorized:
+            if session.authorizes_zone_type(zone_type):
+                return session.session_id
 
-        while self.is_running:
-            if self.cap is None or not self.cap.isOpened():
-                if time.time() > reconnect_at:
-                    reconnect_at = time.time() + 3.0
-                    with self.frame_lock:
-                        self.cap = VideoSource.create_capture(
-                            self.source,
-                            width=self.inference_width,
-                            height=self.inference_height,
-                        )
-                        connected = self.cap is not None and self.cap.isOpened()
-                    if not connected:
-                        self._broadcast_camera_status("CAMERA_OFFLINE")
-                    else:
-                        self.is_connected = True
-                        self._broadcast_camera_status("CAMERA_ONLINE")
-                time.sleep(0.05)
+        return None
+
+    # ── Main per-frame entry point ─────────────
+    def process_frame(
+        self,
+        camera_id: str,
+        tracks: List[Dict[str, Any]],
+        zones: List[Dict[str, Any]],
+        frame_shape: Tuple[int, ...],
+    ):
+        """
+        Called once per processed video frame (from the async protection worker).
+        Evaluates real tracks against camera-specific zones.
+        Produces events without threat scoring.
+        """
+        now = time.time()
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+        is_night = self.is_night_time()
+        h, w = frame_shape[:2]
+
+        # Build zone contours for this frame's resolution
+        scaled_zones = self._build_zone_contours(zones, w, h)
+
+        seen_keys: Set[Tuple[str, int]] = set()
+
+        for track_data in tracks:
+            t_id = track_data.get("track_id", -1)
+            if t_id < 0:
                 continue
 
-            ret, raw = self.cap.read()
-            if ret and raw is not None and raw.size > 0:
-                self.is_connected = True
-                with self.frame_lock:
-                    self.latest_raw_frame = raw
-                self.new_frame_event.set()
-                self.frame_count += 1
-                now = time.time()
-                dt = now - last_t
-                last_t = now
-                if dt > 0:
-                    self.capture_fps = round(self.capture_fps * 0.85 + (1.0 / dt) * 0.15, 1)
-            else:
-                self.is_connected = False
-                with self.frame_lock:
-                    if self.cap:
-                        try:
-                            self.cap.release()
-                        except Exception:
-                            pass
-                        self.cap = None
-                self._broadcast_camera_status("CAMERA_OFFLINE")
-                time.sleep(0.1)
+            key = (camera_id, t_id)
+            seen_keys.add(key)
+            cls_name = track_data["class_name"]
+            box = track_data["box"]
+            conf = track_data["confidence"]
+            ref_pt = self.get_reference_point(box)
+            global_person_id = track_data.get("global_person_id")
+            reid_status = track_data.get("reid_status")
 
-    # ── Thread 2: Inference + Annotate ────────
-    def _inference_worker(self):
-        last_t = time.time()
+            # Initialize track state
+            if key not in self.tracks:
+                self.tracks[key] = TrackState(t_id, cls_name, camera_id, now)
+                # Inherit any active patrol authorization
+                session = self._get_active_patrol_for_camera(camera_id)
+                if session:
+                    self.tracks[key].context.patrol_session_id = session.session_id
 
-        while self.is_running:
-            loop_start = time.time()
-            target_delay = 1.0 / self.inference_fps
+            track = self.tracks[key]
+            track.last_seen = now
+            if global_person_id:
+                track.context.global_person_id = global_person_id
+                track.context.reid_status = reid_status
+            entity_label = f"{cls_name.upper()} #{t_id}"
+            if global_person_id:
+                entity_label = f"{entity_label} [{global_person_id}]"
 
-            self.new_frame_event.wait(timeout=0.1)
-            self.new_frame_event.clear()
-
-            with self.frame_lock:
-                frame = self.latest_raw_frame.copy() if self.latest_raw_frame is not None else None
-
-            if frame is None:
-                frame = self._fallback_frame()
-                tracks_data = []
-                inf_ms = 0.0
-            else:
-                h, w = frame.shape[:2]
-                if w != self.inference_width or h != self.inference_height:
-                    frame = cv2.resize(frame, (self.inference_width, self.inference_height))
-                tracks_data, inf_ms = self._run_inference(frame)
-
-                now = time.time()
-                dt = now - last_t
-                last_t = now
-                if dt > 0:
-                    self.infer_fps = round(self.infer_fps * 0.85 + (1.0 / dt) * 0.15, 1)
-                self.inference_ms = round(inf_ms, 1)
-
-                if settings.ENABLE_ASYNC_PROTECTION and tracks_data:
-                    try:
-                        with self.lock:
-                            zones_snap = list(self.zones)
-                        self.event_queue.put_nowait({
-                            "camera_id": self.camera_id,
-                            "tracks": tracks_data,
-                            "zones": zones_snap,
-                            "shape": frame.shape,
-                            "frame": frame.copy(),
-                        })
-                    except queue.Full:
-                        pass
-
-            annotated = self._render_hud(frame, tracks_data, inf_ms)
-            ret_enc, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 78])
-            if ret_enc:
-                with self.lock:
-                    self.latest_jpeg = buf.tobytes()
-                    self.latest_processed_frame = annotated
-                self.new_jpeg_event.set()
-
-            elapsed = time.time() - loop_start
-            time.sleep(max(0.001, target_delay - elapsed))
-
-    # ── Thread 3: Async Protection ────────────
-    def _async_worker(self):
-        while self.is_running:
-            try:
-                item = self.event_queue.get(timeout=0.5)
-            except queue.Empty:
-                continue
-            try:
-                # Re-ID runs BEFORE the event engine so that ZONE_ENTRY / intrusion
-                # events can carry a persistent global_person_id when available.
-                # Any failure here must never take down zones/vehicles/ANPR/events.
-                if settings.REID_ENABLED:
-                    frame_for_crop = item["frame"]
-                    fh, fw = frame_for_crop.shape[:2]
-                    for ent in item["tracks"]:
-                        if ent.get("class_name", "") != "person":
-                            continue
-                        t_id = ent.get("track_id", -1)
-                        if t_id < 0:
-                            continue
-                        try:
-                            x1, y1, x2, y2 = ent["box"]
-                            # Clip strictly to the SAME frame the detection box came
-                            # from (avoids the classic resized-frame/coordinate-
-                            # mismatch bug that breaks Re-ID crops).
-                            cx1, cy1 = max(0, min(x1, fw - 1)), max(0, min(y1, fh - 1))
-                            cx2, cy2 = max(0, min(x2, fw)), max(0, min(y2, fh))
-                            crop = frame_for_crop[cy1:cy2, cx1:cx2] if cx2 > cx1 and cy2 > cy1 else None
-                            reid_result = reid_service.resolve_person_identity(
-                                camera_id=self.camera_id,
-                                local_track_id=t_id,
-                                crop_bgr=crop,
-                                box=[cx1, cy1, cx2, cy2],
-                                frame_shape=(fh, fw),
-                            )
-                            if reid_result.get("global_id"):
-                                ent["global_person_id"] = reid_result["global_id"]
-                                ent["reid_status"] = reid_result.get("status")
-                                with self.reid_cache_lock:
-                                    self.reid_cache[t_id] = {
-                                        "global_person_id": reid_result["global_id"],
-                                        "reid_status": reid_result.get("status"),
-                                    }
-                        except Exception as reid_err:
-                            logger.debug(f"[{self.camera_id}] Re-ID skipped for track {t_id}: {reid_err}")
-
-                from app.services.event_engine import event_engine
-                event_engine.process_frame(
-                    item["camera_id"], item["tracks"], item["zones"], item["shape"]
+            # ── Step 3: First detection event ──
+            if not track.initial_event_fired:
+                track.initial_event_fired = True
+                evt_type = (
+                    EventType.PERSON_DETECTED
+                    if cls_name == "person"
+                    else EventType.VEHICLE_DETECTED
                 )
-                for ent in item["tracks"]:
-                    t_id = ent.get("track_id", -1)
-                    if t_id >= 0 and ent.get("class_name", "") == "person":
-                        if t_id not in self.face_evaluating:
-                            self.face_evaluating.add(t_id)
-                            self._trigger_face_scan(item["frame"], t_id, ent["box"])
-            except Exception as e:
-                logger.debug(f"[{self.camera_id}] Async worker error: {e}")
-            finally:
-                self.event_queue.task_done()
+                self._record_and_dispatch(
+                    camera_id=camera_id,
+                    entity_label=entity_label,
+                    event_type=evt_type,
+                    time_str=time_str,
+                    confidence=conf,
+                    location=f"Camera {camera_id} field of view",
+                    metadata={
+                        "box": box, "track_id": t_id, "class": cls_name,
+                        "global_person_id": global_person_id, "reid_status": reid_status,
+                    },
+                    track=track,
+                    zone_type=None,
+                )
 
-    def _run_inference(self, frame: np.ndarray) -> tuple[list, float]:
-        if self.model is None:
-            return [], 0.0
-        import time as t
-        t0 = t.perf_counter()
-        persons, vehicles = 0, 0
-        active = []
-        try:
-            results = self.model.track(
-                frame,
-                persist=True,
-                tracker="bytetrack.yaml",
-                conf=self.confidence_threshold,
-                classes=TARGET_CLASS_IDS,
-                device=self.device,
-                verbose=False,
-            )
-            inf_ms = (t.perf_counter() - t0) * 1000.0
-            if results and results[0].boxes is not None:
-                for box in results[0].boxes:
-                    cls_id = int(box.cls[0].item())
-                    cls_name = self.model.names.get(cls_id, f"class_{cls_id}")
-                    conf = float(box.conf[0].item())
-                    tid = int(box.id[0].item()) if box.id is not None else -1
-                    x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
-                    if cls_name == "person":
-                        persons += 1
+            # ── Step 7: Zone state machine ─────
+            active_zone_ids: Set[str] = set()
+
+            for zone_info in scaled_zones:
+                z_id = zone_info["id"]
+                z_name = zone_info["name"]
+                z_type = zone_info["type"]
+                contour = zone_info["contour"]
+
+                inside = self.is_point_in_polygon(ref_pt, contour)
+
+                if inside:
+                    active_zone_ids.add(z_id)
+                    track.context.active_zones.add(z_id)
+                    track.context.zone_types_entered.add(z_type)
+                    track.zone_type_map[z_id] = z_type
+
+                    if z_id not in track.current_zones:
+                        # ── ZONE ENTRY (one event per entry) ──
+                        track.current_zones.add(z_id)
+                        track.zone_entry_times[z_id] = now
+
+                        # Check patrol authorization
+                        patrol_id = self._is_entity_authorized_by_patrol(track, z_type)
+                        if patrol_id:
+                            track.context.patrol_session_id = patrol_id
+                            track.context.authorization_state = AuthorizationState.AUTHORIZED
+
+                        self._record_and_dispatch(
+                            camera_id=camera_id,
+                            entity_label=entity_label,
+                            event_type=EventType.ZONE_ENTRY,
+                            time_str=time_str,
+                            confidence=conf,
+                            location=f"{z_name} ({z_type})",
+                            metadata={
+                                "zone_id": z_id,
+                                "zone_name": z_name,
+                                "zone_type": z_type,
+                                "box": box,
+                                "ref_point": list(ref_pt),
+                                "authorization_state": track.context.authorization_state,
+                                "patrol_session_id": track.context.patrol_session_id,
+                                "global_person_id": global_person_id,
+                                "reid_status": reid_status,
+                            },
+                            track=track,
+                            zone_type=z_type,
+                        )
+
+                        # Night context event
+                        if is_night and z_type in SENSITIVE_ZONE_TYPES:
+                            self._record_and_dispatch(
+                                camera_id=camera_id,
+                                entity_label=entity_label,
+                                event_type=EventType.NIGHT_MOVEMENT,
+                                time_str=time_str,
+                                confidence=conf,
+                                location=f"{z_name} [NIGHT]",
+                                metadata={
+                                    "zone_id": z_id,
+                                    "zone_type": z_type,
+                                    "night_hours": f"{self.night_start_hour}:00-{self.night_end_hour}:00",
+                                },
+                                track=track,
+                                zone_type=z_type,
+                            )
+
                     else:
-                        vehicles += 1
-                    det = {
-                        "track_id": tid,
-                        "class_name": cls_name,
-                        "confidence": round(conf, 3),
-                        "box": [x1, y1, x2, y2],
-                        "camera_id": self.camera_id,
-                    }
-                    if cls_name == "person" and tid >= 0:
-                        with self.reid_cache_lock:
-                            cached = self.reid_cache.get(tid)
-                        if cached:
-                            det["global_person_id"] = cached["global_person_id"]
-                            det["reid_status"] = cached["reid_status"]
-                    active.append(det)
-        except Exception as e:
-            logger.error(f"[{self.camera_id}] Inference error: {e}")
-            return [], 0.0
+                        # ── LOITERING CHECK (Step 8) ──
+                        entry_time = track.zone_entry_times.get(z_id, now)
+                        dwell = now - entry_time
+                        if dwell >= self.loiter_threshold and z_id not in track.loiter_fired_zones:
+                            track.loiter_fired_zones.add(z_id)
+                            self._record_and_dispatch(
+                                camera_id=camera_id,
+                                entity_label=entity_label,
+                                event_type=EventType.LOITERING,
+                                time_str=time_str,
+                                confidence=conf,
+                                location=f"{z_name} [DWELL {int(dwell)}s]",
+                                metadata={
+                                    "zone_id": z_id,
+                                    "zone_name": z_name,
+                                    "zone_type": z_type,
+                                    "dwell_seconds": round(dwell, 1),
+                                    "box": box,
+                                },
+                                track=track,
+                                zone_type=z_type,
+                            )
 
-        # Prune Re-ID cache entries for local track ids ByteTrack is no longer reporting
-        # (person left frame / occluded past recovery). Persistent identity itself lives
-        # in reid_service's DB-backed gallery, not here — this only forgets the transient
-        # local_track_id -> global_id shortcut so a reused/next id doesn't inherit a stale one.
-        current_ids = {t["track_id"] for t in active if t.get("class_name") == "person" and t.get("track_id", -1) >= 0}
-        with self.reid_cache_lock:
-            stale = [k for k in self.reid_cache if k not in current_ids]
-            for k in stale:
-                del self.reid_cache[k]
+            # ── ZONE EXIT ──
+            exited = track.current_zones - active_zone_ids
+            for z_id in exited:
+                z_type = track.zone_type_map.get(z_id, "UNKNOWN")
+                track.current_zones.discard(z_id)
+                track.zone_entry_times.pop(z_id, None)
+                track.loiter_fired_zones.discard(z_id)
+                track.context.active_zones.discard(z_id)
 
-        self.active_tracks = active
-        self.detection_counts = {"person": persons, "vehicle": vehicles, "total": persons + vehicles}
-        return active, inf_ms
+                self._record_and_dispatch(
+                    camera_id=camera_id,
+                    entity_label=entity_label,
+                    event_type=EventType.ZONE_EXIT,
+                    time_str=time_str,
+                    confidence=conf,
+                    location=f"Zone {z_id} boundary",
+                    metadata={"zone_id": z_id, "zone_type": z_type, "box": box},
+                    track=track,
+                    zone_type=z_type,
+                )
 
-    def _trigger_face_scan(self, frame_copy: np.ndarray, track_id: int, box: list):
-        def _worker():
-            try:
-                from app.services.face_service import face_service
-                x1, y1, x2, y2 = box
-                h_f, w_f = frame_copy.shape[:2]
-                pw = int((x2 - x1) * 0.2)
-                ph = int((y2 - y1) * 0.2)
-                crop = frame_copy[
-                    max(0, y1 - ph): min(h_f, y2 + ph),
-                    max(0, x1 - pw): min(w_f, x2 + pw),
-                ]
-                if crop.size > 0:
-                    res = face_service.recognize_face(crop)
-                    self.face_cache[track_id] = res
-                    if res.get("enabled") and res.get("state") in ("MATCHED", "UNVERIFIED"):
-                        from app.services.event_engine import event_engine
-                        event_engine.handle_face_event(self.camera_id, res, track_id)
-            except Exception as e:
-                logger.debug(f"[{self.camera_id}] Face scan error: {e}")
-            finally:
-                self.face_evaluating.discard(track_id)
+        # Purge stale tracks (>30s unseen)
+        stale = [k for k, trk in self.tracks.items() if now - trk.last_seen > 30.0]
+        for k in stale:
+            del self.tracks[k]
 
-        threading.Thread(target=_worker, daemon=True).start()
-
-    def _broadcast_camera_status(self, event_type: str):
-        from app.websocket.connection_manager import manager
-        manager.broadcast_sync({
-            "type": event_type,
-            "camera_id": self.camera_id,
-            "source": str(self.source),
-            "timestamp": __import__("datetime").datetime.now().strftime("%H:%M:%S"),
-        })
-        logger.info(f"[{self.camera_id}] {event_type}")
-
-    def _fallback_frame(self) -> np.ndarray:
-        frame = np.zeros((self.inference_height, self.inference_width, 3), dtype=np.uint8)
-        frame[:] = (20, 15, 10)
-        cv2.putText(
-            frame,
-            f"[{self.camera_id}] SENSOR OFFLINE",
-            (20, self.inference_height // 2),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2,
-        )
-        cv2.putText(
-            frame,
-            time.strftime("%Y-%m-%d %H:%M:%S"),
-            (20, self.inference_height - 20),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (100, 100, 100), 1,
-        )
-        return frame
-
-    def _render_hud(self, frame: np.ndarray, tracks: list, inf_ms: float) -> np.ndarray:
-        canvas = frame.copy()
-        h, w = canvas.shape[:2]
-
-        # Draw zones
-        with self.lock:
-            zones_snap = list(self.zones)
-        for z in zones_snap:
+    # ── Zone contour builder ───────────────────
+    def _build_zone_contours(
+        self, zones: List[Dict[str, Any]], w: int, h: int
+    ) -> List[Dict[str, Any]]:
+        result = []
+        for z in zones:
             pts = z.get("points_json", [])
-            if len(pts) >= 3:
+            if not pts or len(pts) < 3:
+                continue
+            try:
                 parsed = []
                 for p in pts:
                     if isinstance(p, dict):
@@ -510,220 +396,456 @@ class CameraPipeline:
                         px, py = float(p[0]), float(p[1])
                     else:
                         continue
+                    # Normalize: accept 0-100 (percentage) or 0.0-1.0
                     if px > 1.0:
                         px /= 100.0
                     if py > 1.0:
                         py /= 100.0
                     parsed.append([int(px * w), int(py * h)])
+
                 if len(parsed) >= 3:
-                    poly = np.array(parsed, np.int32).reshape((-1, 1, 2))
-                    cv2.polylines(canvas, [poly], True, (0, 165, 255), 2)
-
-        # Draw tracks
-        for trk in tracks:
-            x1, y1, x2, y2 = trk["box"]
-            cls = trk["class_name"]
-            tid = trk.get("track_id", -1)
-            conf = trk.get("confidence", 0.0)
-            gpid = trk.get("global_person_id")
-            color = (0, 255, 128) if cls == "person" else (255, 180, 0)
-            if gpid:
-                color = (0, 210, 255) if trk.get("reid_status") == "REIDENTIFIED" else (0, 255, 128)
-            cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-            base_label = f"{cls.upper()} #{tid} ({int(conf*100)}%)" if tid >= 0 else f"{cls.upper()} ({int(conf*100)}%)"
-            label = f"{base_label} [{gpid}]" if gpid else base_label
-            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)
-            cv2.rectangle(canvas, (x1, max(0, y1 - th - 6)), (x1 + tw + 4, max(0, y1)), color, -1)
-            cv2.putText(canvas, label, (x1 + 2, max(th + 2, y1 - 3)), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 0), 1)
-
-        # Header
-        hdr = np.zeros((26, w, 3), dtype=np.uint8)
-        hdr[:] = (15, 11, 8)
-        canvas[0:26] = cv2.addWeighted(canvas[0:26], 0.3, hdr, 0.7, 0)
-        sc = (0, 255, 128) if self.is_connected else (0, 0, 255)
-        cv2.circle(canvas, (12, 13), 4, sc, -1)
-        cv2.putText(canvas, f"TEJAS [{self.camera_id}] | {self.source}", (24, 17), cv2.FONT_HERSHEY_SIMPLEX, 0.38, (240, 240, 240), 1)
-
-        # Footer
-        ftr = np.zeros((22, w, 3), dtype=np.uint8)
-        ftr[:] = (15, 11, 8)
-        canvas[h-22:h] = cv2.addWeighted(canvas[h-22:h], 0.3, ftr, 0.7, 0)
-        info = f"YOLOv8+ByteTrack | CAP:{self.capture_fps:.1f} INF:{self.infer_fps:.1f}fps | {inf_ms:.0f}ms | T:{len(tracks)}"
-        cv2.putText(canvas, info, (8, h - 7), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0, 215, 255), 1)
-
-        return canvas
-
-    def get_telemetry(self) -> Dict[str, Any]:
-        with self.lock:
-            return {
-                "camera_id": self.camera_id,
-                "source": str(self.source),
-                "is_connected": self.is_connected,
-                "capture_fps": self.capture_fps,
-                "infer_fps": self.infer_fps,
-                "inference_ms": self.inference_ms,
-                "device": self.device,
-                "model": "YOLOv8-N",
-                "tracker": "ByteTrack",
-                "confidence_threshold": self.confidence_threshold,
-                "target_inference_fps": self.inference_fps,
-                "detection_counts": self.detection_counts,
-                "active_tracks": self.active_tracks,
-                "zone_count": len(self.zones),
-            }
-
-    def _create_standby_frame(self, message: str = "CONNECTING TO STREAM") -> bytes:
-        img = np.zeros((480, 640, 3), dtype=np.uint8)
-        # Tactical border
-        cv2.rectangle(img, (12, 12), (628, 468), (45, 45, 45), 1)
-        cv2.rectangle(img, (16, 16), (624, 464), (30, 30, 30), 1)
-        # Tactical crosshairs
-        cv2.line(img, (320, 20), (320, 40), (60, 60, 60), 1)
-        cv2.line(img, (320, 440), (320, 460), (60, 60, 60), 1)
-        cv2.line(img, (20, 240), (40, 240), (60, 60, 60), 1)
-        cv2.line(img, (600, 240), (620, 240), (60, 60, 60), 1)
-        
-        # Header Info
-        cv2.putText(img, f"TEJAS NODE: {self.camera_id}", (30, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 210, 255), 2)
-        cv2.putText(img, f"SOURCE: {str(self.source)[:45]}", (30, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (170, 170, 170), 1)
-        
-        # Status Box
-        is_connecting = "CONNECTING" in message
-        status_color = (0, 180, 255) if is_connecting else (0, 70, 255)
-        cv2.putText(img, f"[ {message} ]", (70, 225), cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
-        cv2.putText(img, "Verify IP camera / phone streaming server is active", (70, 260), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (160, 160, 160), 1)
-        
-        # Timestamp
-        ts = time.strftime("%Y-%m-%d %H:%M:%S UTC")
-        cv2.putText(img, ts, (30, 445), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (100, 100, 100), 1)
-        
-        ret, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        return buf.tobytes() if ret else b""
-
-    def generate_mjpeg_stream(self):
-        last_standby_time = 0.0
-        while self.is_running:
-            self.new_jpeg_event.wait(timeout=0.1)
-            self.new_jpeg_event.clear()
-            
-            with self.lock:
-                jpeg = self.latest_jpeg
-                connected = self.is_connected
-            now = time.time()
-            if jpeg and connected:
-                yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + jpeg + b"\r\n"
-            else:
-                # Send standby frame at ~2 fps so browser immediately displays status instead of spinning
-                if now - last_standby_time >= 0.5:
-                    status_msg = "CONNECTING TO STREAM" if not connected else "STREAM SYNCING"
-                    standby = self._create_standby_frame(status_msg)
-                    if standby:
-                        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + standby + b"\r\n"
-                    last_standby_time = now
-
-
-# ──────────────────────────────────────────────
-# CameraManager — manages N camera pipelines
-# ──────────────────────────────────────────────
-class CameraManager:
-    """
-    Singleton manager for all active camera pipelines.
-    Each camera pipeline is independent — failures are isolated.
-    """
-
-    def __init__(self):
-        self._pipelines: Dict[str, CameraPipeline] = {}
-        self._lock = threading.Lock()
-        self._device = "cuda:0" if _CUDA_AVAILABLE else "cpu"
-        self._model_path = _resolve_model_path()
-        logger.info(f"CameraManager initialized — device={self._device} model={self._model_path}")
-
-    def _make_pipeline(self, camera_id: str, source: Union[int, str]) -> CameraPipeline:
-        p = CameraPipeline(
-            camera_id=camera_id,
-            source=source,
-            model_path=self._model_path,
-            device=self._device,
-            inference_fps=settings.TARGET_INFERENCE_FPS,
-            inference_width=settings.INFERENCE_WIDTH,
-            inference_height=settings.INFERENCE_HEIGHT,
-        )
-        p.load_model()
-        p.reload_zones()
-        return p
-
-    def start_camera(self, camera_id: str, source: Union[int, str]) -> CameraPipeline:
-        with self._lock:
-            if camera_id in self._pipelines:
-                logger.info(f"Camera {camera_id} already running")
-                return self._pipelines[camera_id]
-            p = self._make_pipeline(camera_id, source)
-            p.start()
-            self._pipelines[camera_id] = p
-        return p
-
-    def stop_camera(self, camera_id: str):
-        with self._lock:
-            p = self._pipelines.pop(camera_id, None)
-        if p:
-            p.stop()
-
-    def stop_all(self):
-        with self._lock:
-            ids = list(self._pipelines.keys())
-        for camera_id in ids:
-            self.stop_camera(camera_id)
-
-    def get_pipeline(self, camera_id: str) -> Optional[CameraPipeline]:
-        with self._lock:
-            return self._pipelines.get(camera_id)
-
-    def list_active(self) -> List[str]:
-        with self._lock:
-            return list(self._pipelines.keys())
-
-    def get_all_telemetry(self) -> Dict[str, Any]:
-        with self._lock:
-            pipelines = dict(self._pipelines)
-        return {cid: p.get_telemetry() for cid, p in pipelines.items()}
-
-    def reload_zones(self, camera_id: Optional[str] = None):
-        with self._lock:
-            targets = [camera_id] if camera_id else list(self._pipelines.keys())
-        for cid in targets:
-            p = self.get_pipeline(cid)
-            if p:
-                p.reload_zones()
-
-    def switch_source(self, camera_id: str, new_source: Union[int, str]) -> Dict[str, Any]:
-        """Test candidate source and swap atomically if successful."""
-        test = VideoSource.test_source(new_source, timeout_seconds=3.0)
-        if not test.get("success"):
-            return {"success": False, "error": test.get("error", "Source test failed")}
-
-        p = self.get_pipeline(camera_id)
-        if p is None:
-            self.start_camera(camera_id, new_source)
-            return {"success": True, "camera_id": camera_id, "source": str(new_source)}
-
-        new_cap = VideoSource.create_capture(new_source, width=p.inference_width, height=p.inference_height)
-        if new_cap is None or not new_cap.isOpened():
-            return {"success": False, "error": "Could not open new capture handle"}
-
-        with p.frame_lock:
-            old_cap = p.cap
-            p.cap = new_cap
-            p.source = new_source
-            p.is_connected = True
-            p.active_tracks = []
-        if old_cap:
-            try:
-                old_cap.release()
+                    result.append({
+                        "id": z.get("id"),
+                        "name": z.get("name", "Zone"),
+                        "type": z.get("type", ZoneType.RESTRICTED),
+                        "contour": np.array(parsed, dtype=np.int32),
+                    })
             except Exception:
-                pass
+                continue
+        return result
 
-        return {"success": True, "camera_id": camera_id, "source": str(new_source), "resolution": test.get("resolution")}
+    # ── ANPR event handler ─────────────────────
+    def handle_anpr_event(
+        self,
+        camera_id: str,
+        anpr_result: Dict[str, Any],
+        track_id: Optional[int] = None,
+    ):
+        if not anpr_result or not anpr_result.get("plate_detected"):
+            return
+
+        now = time.time()
+        time_str = anpr_result.get("timestamp") or datetime.datetime.now().strftime("%H:%M:%S")
+        plate_number = anpr_result.get("plate_number") or "UNKNOWN"
+        conf = float(anpr_result.get("confidence_after", 0.0))
+
+        t_key = (camera_id, track_id if track_id is not None and track_id >= 0 else -1)
+        if t_key in self.tracks:
+            track = self.tracks[t_key]
+            track.context.plate_identity = plate_number
+            entity_label = f"VEHICLE #{track_id} [{plate_number}]"
+        else:
+            virtual_key = (camera_id, 8000 + abs(hash(plate_number)) % 1000)
+            if virtual_key not in self.tracks:
+                self.tracks[virtual_key] = TrackState(virtual_key[1], "vehicle", camera_id, now)
+            track = self.tracks[virtual_key]
+            track.context.plate_identity = plate_number
+            entity_label = f"VEHICLE [{plate_number}]"
+
+        track.last_seen = now
+
+        self._record_and_dispatch(
+            camera_id=camera_id,
+            entity_label=entity_label,
+            event_type=EventType.PLATE_DETECTED,
+            time_str=time_str,
+            confidence=conf,
+            location=f"Camera {camera_id} checkpoint",
+            metadata={
+                "plate_number": plate_number,
+                "raw_ocr_text": anpr_result.get("raw_ocr_text"),
+                "quality_score": anpr_result.get("quality_assessment", {}).get("quality_score"),
+                "watchlist_status": anpr_result.get("watchlist_status"),
+                "track_id": track_id,
+            },
+            track=track,
+            zone_type=None,
+        )
+
+        if anpr_result.get("watchlist_match"):
+            track.context.watchlist_plate_match = True
+            track.context.authorization_state = AuthorizationState.WATCHLIST_MATCH
+            wl = anpr_result.get("watchlist_entry", {})
+            self._record_and_dispatch(
+                camera_id=camera_id,
+                entity_label=entity_label,
+                event_type=EventType.WATCHLIST_PLATE_MATCH,
+                time_str=time_str,
+                confidence=conf,
+                location=f"Perimeter checkpoint — {wl.get('title', 'Flagged Vehicle')}",
+                metadata={
+                    "plate_number": plate_number,
+                    "watchlist_id": wl.get("id"),
+                    "category": wl.get("category"),
+                    "notes": wl.get("notes"),
+                },
+                track=track,
+                zone_type=None,
+            )
+
+        # Broadcast ANPR-specific payload
+        manager.broadcast_sync({"type": "ANPR_DETECTION", "data": anpr_result})
+
+    # ── Face event handler ─────────────────────
+    def handle_face_event(
+        self,
+        camera_id: str,
+        face_result: Dict[str, Any],
+        track_id: Optional[int] = None,
+    ):
+        if not face_result or not face_result.get("enabled"):
+            return
+
+        state = face_result.get("state")
+        best_match = face_result.get("best_match")
+        now = time.time()
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+
+        t_key = (camera_id, track_id if track_id is not None and track_id >= 0 else -1)
+        if t_key not in self.tracks:
+            virtual_key = (camera_id, 7000 + (track_id % 1000 if track_id else int(now) % 1000))
+            if virtual_key not in self.tracks:
+                self.tracks[virtual_key] = TrackState(virtual_key[1], "person", camera_id, now)
+            t_key = virtual_key
+
+        track = self.tracks[t_key]
+        track.last_seen = now
+
+        # Broadcast biometric HUD update (neutral — always sent)
+        manager.broadcast_sync({
+            "type": "FACE_RECOGNITION_EVENT",
+            "data": {
+                "camera_id": camera_id,
+                "track_id": track_id,
+                "state": state,
+                "faces_detected": face_result.get("faces_detected", 0),
+                "best_match": best_match,
+                "timestamp": time_str,
+            },
+        })
+
+        if state == "UNVERIFIED":
+            track.context.authorization_state = AuthorizationState.UNVERIFIED
+            return
+
+        if state == "MATCHED" and best_match:
+            identity = best_match.get("matched_identity", {})
+            category = identity.get("category", "WATCHLIST")
+            name = identity.get("name", "Unknown")
+            conf = float(best_match.get("confidence", 0.0))
+
+            track.context.face_identity = name
+
+            if category == "WATCHLIST":
+                track.context.watchlist_face_match = True
+                track.context.authorization_state = AuthorizationState.WATCHLIST_MATCH
+                self._record_and_dispatch(
+                    camera_id=camera_id,
+                    entity_label=f"WATCHLIST PERSON [{name}]",
+                    event_type=EventType.WATCHLIST_FACE_MATCH,
+                    time_str=time_str,
+                    confidence=conf,
+                    location=f"Biometric checkpoint ({camera_id})",
+                    metadata={
+                        "face_id": identity.get("id"),
+                        "name": name,
+                        "category": category,
+                        "similarity": best_match.get("similarity"),
+                        "notes": identity.get("notes"),
+                        "box": best_match.get("box_global"),
+                    },
+                    track=track,
+                    zone_type=None,
+                )
+
+            elif category in ("AUTHORIZED", "SECURITY_STAFF"):
+                track.context.authorization_state = AuthorizationState.AUTHORIZED
+                self._record_and_dispatch(
+                    camera_id=camera_id,
+                    entity_label=f"AUTHORIZED [{name}]",
+                    event_type=EventType.AUTHORIZED_FACE_VERIFIED,
+                    time_str=time_str,
+                    confidence=conf,
+                    location=f"Access portal ({camera_id})",
+                    metadata={"face_id": identity.get("id"), "name": name, "category": category},
+                    track=track,
+                    zone_type=None,
+                )
+
+    # ── Cross-camera handoff (Step 20) ─────────
+    def handle_cross_camera_candidate(
+        self,
+        global_track_id: str,
+        from_camera: str,
+        to_camera: str,
+        similarity_score: float,
+        transit_seconds: float,
+        entity_type: str = "PERSON",
+        snapshot_b64: Optional[str] = None,
+        match_status: str = "MATCH",
+    ):
+        now = time.time()
+        time_str = datetime.datetime.now().strftime("%H:%M:%S")
+        virtual_key = (to_camera, 9000 + abs(hash(global_track_id)) % 1000)
+        if virtual_key not in self.tracks:
+            self.tracks[virtual_key] = TrackState(virtual_key[1], entity_type.lower(), to_camera, now)
+        track = self.tracks[virtual_key]
+        track.last_seen = now
+
+        self._record_and_dispatch(
+            camera_id=to_camera,
+            entity_label=f"{entity_type.upper()} [{global_track_id}]",
+            event_type=EventType.CROSS_CAMERA_CANDIDATE,
+            time_str=time_str,
+            confidence=similarity_score,
+            location=f"Transit: {from_camera} -> {to_camera}",
+            metadata={
+                "global_track_id": global_track_id,
+                "from_camera": from_camera,
+                "to_camera": to_camera,
+                "similarity_score": round(similarity_score, 3),
+                "transit_seconds": round(transit_seconds, 1),
+                "snapshot_b64": snapshot_b64,
+                "match_status": match_status,
+            },
+            track=track,
+            zone_type=None,
+        )
+        manager.broadcast_sync({
+            "type": "CROSS_CAMERA_CANDIDATE",
+            "data": {
+                "global_track_id": global_track_id,
+                "from_camera": from_camera,
+                "to_camera": to_camera,
+                "similarity_score": round(similarity_score, 3),
+                "transit_seconds": round(transit_seconds, 1),
+                "timestamp": time_str,
+                "match_status": match_status,
+            },
+        })
+
+    handle_cross_camera_handoff = handle_cross_camera_candidate
+
+    # ── Record + Dispatch (Step 9 / 14 / 17) ──
+    def _record_and_dispatch(
+        self,
+        camera_id: str,
+        entity_label: str,
+        event_type: str,
+        time_str: str,
+        confidence: float,
+        location: str,
+        metadata: Dict[str, Any],
+        track: TrackState,
+        zone_type: Optional[str],
+    ):
+        """
+        1. Evaluates operational alert level (no threat score).
+        2. Persists Event record to DB.
+        3. Creates Alert / Incident only when alert level warrants it.
+        4. Captures evidence reference where present.
+        5. Broadcasts WebSocket event.
+        """
+        event_id = f"EVT-{uuid.uuid4().hex[:8].upper()}"
+
+        # ── Operational alert evaluation ──
+        alert_level, alert_reason = evaluate_alert_level(
+            event_type, track.context, zone_type
+        )
+
+        # ── Timeline entry ──
+        track.timeline.append({
+            "time": time_str,
+            "camera": camera_id,
+            "event": f"{event_type.replace('_', ' ').title()}: {location}",
+            "alert_level": alert_level,
+        })
+
+        db = SessionLocal()
+        created_alert_data = None
+        created_incident_data = None
+
+        try:
+            # 1. Insert Event
+            db_event = Event(
+                id=event_id,
+                event_type=event_type,
+                camera_id=camera_id,
+                entity_id=entity_label,
+                timestamp=time_str,
+                confidence=float(confidence),
+                location=location,
+                metadata_json={
+                    **metadata,
+                    "alert_level": alert_level,
+                    "alert_reason": alert_reason,
+                    "authorization_state": track.context.authorization_state,
+                    "patrol_session_id": track.context.patrol_session_id,
+                },
+            )
+            db.add(db_event)
+
+            # 2. Create Alert if warranted
+            if should_create_alert(alert_level):
+                alert_id = f"ALT-{uuid.uuid4().hex[:6].upper()}"
+                alert_msg = (
+                    f"{event_type.replace('_', ' ').title()} on {camera_id} "
+                    f"by {entity_label} at {location}. Context: {alert_reason}"
+                )
+                db_alert = Alert(
+                    id=alert_id,
+                    camera=camera_id,
+                    title=f"[{alert_level}] {event_type.replace('_', ' ').title()}",
+                    severity=alert_level,           # INFO/NOTICE/ALERT/PRIORITY
+                    threat_score=0,                 # Retained column — always 0 in Phase 2
+                    message=alert_msg,
+                    timestamp=time_str,
+                )
+                db.add(db_alert)
+                created_alert_data = {
+                    "id": alert_id,
+                    "camera": camera_id,
+                    "title": db_alert.title,
+                    "alert_level": alert_level,
+                    "message": alert_msg,
+                    "timestamp": time_str,
+                }
+
+            # 3. Create/update Incident if warranted
+            inc_title = None
+            if should_create_incident(alert_level, track.context):
+                evidence_img = (
+                    metadata.get("snapshot_b64")
+                    or metadata.get("raw_crop_base64")
+                    or metadata.get("crop_b64")
+                )
+                if track.incident_id:
+                    db_inc = db.query(Incident).filter(Incident.id == track.incident_id).first()
+                    if db_inc:
+                        db_inc.timeline = track.timeline
+                        db_event.incident_id = db_inc.id
+                        inc_title = db_inc.title
+                        if evidence_img:
+                            evidence_service.create_evidence_record(
+                                db=db,
+                                incident_id=db_inc.id,
+                                camera_id=camera_id,
+                                evidence_type="SNAPSHOT",
+                                event_id=event_id,
+                                track_id=str(track.track_id),
+                                threat_score=0,
+                                image_data=evidence_img,
+                                metadata_json={"event_type": event_type, "location": location},
+                                timestamp_str=time_str,
+                            )
+                        created_incident_data = {
+                            "id": db_inc.id,
+                            "title": db_inc.title,
+                            "target_entity": entity_label,
+                            "alert_level": alert_level,
+                            "primary_camera": camera_id,
+                            "timestamp": db_inc.timestamp,
+                            "status": db_inc.status,
+                            "timeline": track.timeline,
+                        }
+                else:
+                    inc_id = f"INC-{datetime.date.today().strftime('%Y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
+                    track.incident_id = inc_id
+                    db_event.incident_id = inc_id
+                    inc_title = f"[{alert_level}] {event_type.replace('_', ' ').title()}"
+                    db_inc = Incident(
+                        id=inc_id,
+                        title=inc_title,
+                        target_entity=entity_label,
+                        threat_score=0,            # Retained column — 0 in Phase 2
+                        severity=alert_level,      # Repurposed: alert level
+                        primary_camera=camera_id,
+                        timestamp=time_str,
+                        status="NEW",
+                        assigned_to="Duty Officer",
+                        threat_factors=[{
+                            "alert_level": alert_level,
+                            "reason": alert_reason,
+                            "authorization_state": track.context.authorization_state,
+                        }],
+                        timeline=track.timeline,
+                        anpr_data={},
+                        affected_track_id=str(track.track_id),
+                    )
+                    db.add(db_inc)
+                    db.add(AuditLog(
+                        incident_id=inc_id,
+                        user="TEJAS AI Engine",
+                        action=f"Incident auto-created [{alert_level}] — {event_type} — {alert_reason}",
+                        timestamp=time_str,
+                        details={"event_type": event_type, "camera_id": camera_id, "reason": alert_reason},
+                    ))
+                    if evidence_img:
+                        evidence_service.create_evidence_record(
+                            db=db,
+                            incident_id=inc_id,
+                            camera_id=camera_id,
+                            evidence_type="SNAPSHOT",
+                            event_id=event_id,
+                            track_id=str(track.track_id),
+                            threat_score=0,
+                            image_data=evidence_img,
+                            metadata_json={"event_type": event_type, "location": location},
+                            timestamp_str=time_str,
+                        )
+                    created_incident_data = {
+                        "id": inc_id,
+                        "title": inc_title,
+                        "target_entity": entity_label,
+                        "alert_level": alert_level,
+                        "primary_camera": camera_id,
+                        "timestamp": time_str,
+                        "status": "NEW",
+                        "timeline": track.timeline,
+                    }
+
+            db.commit()
+
+        except Exception as e:
+            db.rollback()
+            logger.error(f"DB write failed for event {event_id}: {e}", exc_info=True)
+        finally:
+            db.close()
+
+        # 4. Broadcast WebSocket event (Step 17)
+        ws_payload = {
+            "type": "OPERATIONAL_EVENT",
+            "event": {
+                "id": event_id,
+                "event_type": event_type,
+                "camera_id": camera_id,
+                "entity_id": entity_label,
+                "timestamp": time_str,
+                "confidence": round(float(confidence), 3),
+                "location": location,
+                "alert_level": alert_level,
+                "alert_reason": alert_reason,
+                "authorization_state": track.context.authorization_state,
+                "patrol_session_id": track.context.patrol_session_id,
+                "metadata": metadata,
+            },
+            "alert": created_alert_data,
+            "incident": created_incident_data,
+        }
+        manager.broadcast_sync(ws_payload)
+
+        if created_incident_data and created_incident_data.get("status") == "NEW":
+            manager.broadcast_sync({
+                "type": "NEW_INCIDENT",
+                "incident": created_incident_data,
+                "alert_level": alert_level,
+                "message": f"[{alert_level}] {created_incident_data['id']}: {inc_title if created_incident_data else event_type} on {camera_id}",
+            })
+
+        logger.info(
+            f"[{alert_level}] {event_type} | {entity_label} | {camera_id} | {location} | {alert_reason}"
+        )
 
 
-# ── Global singleton ───────────────────────────
-camera_manager = CameraManager()
+# ── Global singleton (Phase 2 — will be replaced by per-camera in Step 19) ──
+event_engine = EventEngine()
